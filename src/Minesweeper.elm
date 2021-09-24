@@ -323,7 +323,7 @@ boardState board =
     if values |> List.any (\c -> c.mined && c.state == Revealed) then
         Lost
 
-    else if values |> List.all (\c -> c.state == Revealed && not c.mined || c.state == Flagged && c.mined) then
+    else if values |> List.all (\c -> c.state == Revealed || c.mined) then
         Won
 
     else
