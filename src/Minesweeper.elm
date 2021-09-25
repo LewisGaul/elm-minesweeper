@@ -16,88 +16,105 @@ type alias Flags =
     ()
 
 
-boardSize : Int
-boardSize =
-    10
-
-
 type alias Model =
     { game : Game
-    , controlPressed : Bool
+    , ctrlPressed : Bool
     }
 
 
-type Game
-    = Loading
-    | Loaded { state : GameState, board : Board }
+type alias Game =
+    { state : GameState
+    , xSize : Int
+    , ySize : Int
+    , mines : Int
+    , mineCoords : Maybe (List Coord)
+    , board : Board
+    }
 
 
 type GameState
-    = Playing
+    = Ready
+    | Active
     | Lost
     | Won
 
 
-type alias Position =
+type alias Coord =
     ( Int, Int )
 
 
-type alias Cells cache =
-    Dict Position (Cell cache)
-
-
 type alias Board =
-    { size : Int
-    , mines : Int
-    , cells : Cells Cache
-    }
+    Dict Coord CellState
 
 
 type CellState
-    = Hidden { pushed : Bool }
+    = Unclicked { pushed : Bool }
+    | Num Int
     | Flagged
-    | Revealed
-
-
-type alias Cell cache =
-    { cache
-        | state : CellState
-        , mined : Bool
-    }
-
-
-type alias Cache =
-    { neighbouringMines : Int
-    }
+    | Mine
 
 
 type Msg
     = NewGame
-    | GenerateBoard { size : Int, mined : Set Position }
-    | ToggleFlag Position
-    | Reveal Position
-    | SetControlPressed Bool
-    | SetPushed { position : Position, pushed : Bool }
+    | GeneratedMineCoords (List Coord)
+    | ToggleFlagCell Coord
+      --| SelectCell Coord
+    | SinkCell Coord
+    | RaiseCell Coord
+    | SetCtrlPressed Bool
     | NoOp
 
 
 main : Program Flags Model Msg
 main =
-    Browser.document { init = init, view = view, update = update, subscriptions = subscriptions }
+    Browser.document
+        { init = init
+        , view = view
+        , update = update
+        , subscriptions = subscriptions
+        }
 
 
-newBoard : Cmd Msg
-newBoard =
+makeBoard : Int -> Int -> Board
+makeBoard xSize ySize =
     let
-        toMsg =
-            \mined -> GenerateBoard { size = boardSize, mined = mined }
+        xAxis =
+            List.range 0 (xSize - 1)
+
+        yAxis =
+            List.range 0 (ySize - 1)
+
+        coords =
+            xAxis |> List.concatMap (\x -> yAxis |> List.map (\y -> ( x, y )))
     in
-    Random.generate toMsg (randomMinePositionGenerator boardSize boardSize)
+    coords
+        |> List.map (\x -> ( x, Unclicked { pushed = False } ))
+        |> Dict.fromList
 
 
 init : Flags -> ( Model, Cmd Msg )
 init _ =
-    ( { game = Loading, controlPressed = False }, newBoard )
+    let
+        xSize =
+            8
+
+        ySize =
+            8
+
+        mines =
+            10
+
+        initGame : Game
+        initGame =
+            { state = Ready
+            , xSize = xSize
+            , ySize = ySize
+            , mines = mines
+            , mineCoords = Nothing
+            , board = makeBoard xSize ySize
+            }
+    in
+    ( { game = initGame, ctrlPressed = False }, Cmd.none )
 
 
 view : Model -> { title : String, body : List (Html Msg) }
@@ -109,52 +126,54 @@ view model =
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
+    let
+        game =
+            model.game
+    in
     case msg of
         NewGame ->
-            ( { model | game = Loading }, newBoard )
+            ( { model | game = { game | mineCoords = Nothing } }, Cmd.none )
 
-        GenerateBoard { size, mined } ->
-            let
-                axis =
-                    List.range 0 (size - 1)
+        GeneratedMineCoords coords ->
+            ( { model | game = { game | mineCoords = Just coords } }, Cmd.none )
 
-                positions =
-                    axis |> List.concatMap (\x -> axis |> List.map (\y -> ( x, y )))
+        ToggleFlagCell pos ->
+            changeBoard model (atCoord pos toggleFlag)
 
-                cells =
-                    positions |> List.map (generateCell mined) |> Dict.fromList
-            in
-            ( { model | game = Loaded { state = Playing, board = Board size (Set.size mined) (computeCaches cells) } }
-            , Cmd.none
-            )
-
-        ToggleFlag pos ->
-            changeBoard model (atPosition pos toggleFlag)
-
-        Reveal pos ->
+        --SelectCell pos ->
+        --    let
+        --        op =
+        --            if model.ctrlPressed then
+        --                \b -> applyToSurrounding b pos reveal
+        --
+        --            else
+        --                \b -> Dict.get pos b.cells |> Maybe.map (reveal b pos) |> Maybe.withDefault b
+        --    in
+        --    changeBoard model op
+        SinkCell coord ->
             let
                 op =
-                    if model.controlPressed then
-                        \b -> applyToSurrounding b pos reveal
+                    if model.ctrlPressed then
+                        \b -> applyToSurrounding b coord (\board -> \p -> \_ -> atCoord p (trySinkCell True) board)
 
                     else
-                        \b -> Dict.get pos b.cells |> Maybe.map (reveal b pos) |> Maybe.withDefault b
+                        atCoord coord (trySinkCell True)
             in
             changeBoard model op
 
-        SetControlPressed controlPressed ->
-            ( { model | controlPressed = controlPressed }, Cmd.none )
-
-        SetPushed { position, pushed } ->
+        RaiseCell coord ->
             let
                 op =
-                    if model.controlPressed then
-                        \b -> applyToSurrounding b position (\board -> \p -> \_ -> atPosition p (trySetPushed pushed) board)
+                    if model.ctrlPressed then
+                        \b -> applyToSurrounding b coord (\board -> \p -> \_ -> atCoord p (trySinkCell False) board)
 
                     else
-                        atPosition position (trySetPushed pushed)
+                        atCoord coord (trySinkCell False)
             in
             changeBoard model op
+
+        SetCtrlPressed ctrlPressed ->
+            ( { model | ctrlPressed = ctrlPressed }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -170,36 +189,40 @@ subscriptions _ =
 
 viewGame : Model -> Html Msg
 viewGame model =
-    case model.game of
-        Loading ->
-            Html.text "Mining the field…"
+    let
+        game =
+            model.game
 
-        Loaded { state, board } ->
-            let
-                gameOver =
-                    case state of
-                        Playing ->
-                            Nothing
+        board =
+            game.board
 
-                        Lost ->
-                            Just "Oh no! You hit a mine!"
+        gameOver =
+            case game.state of
+                Ready ->
+                    Nothing
 
-                        Won ->
-                            Just "You cleared the field! Well done."
-            in
-            Html.div [ HtmlA.id "game" ]
-                [ viewDetails board
-                , viewBoard (gameOver /= Nothing) board
-                , gameOver |> Maybe.map viewGameOver |> Maybe.withDefault (Html.text "")
-                ]
+                Active ->
+                    Nothing
+
+                Lost ->
+                    Just "Oh no! You hit a mine!"
+
+                Won ->
+                    Just "You cleared the field! Well done."
+    in
+    Html.div [ HtmlA.id "game" ]
+        [ viewDetails game
+        , viewBoard (gameOver /= Nothing) board
+        , gameOver |> Maybe.map viewGameOver |> Maybe.withDefault (Html.text "")
+        ]
 
 
-viewDetails : Board -> Html msg
-viewDetails board =
+viewDetails : Game -> Html msg
+viewDetails game =
     Html.div [ HtmlA.id "details" ]
         [ Html.p [ HtmlA.class "mines-left", HtmlA.title "Mines Left" ]
-            [ board.mines
-                - (board.cells |> Dict.values |> List.filter (\c -> c.state == Flagged) |> List.length)
+            [ game.mines
+                - (game.board |> Dict.values |> List.filter (\c -> c == Flagged) |> List.length)
                 |> String.fromInt
                 |> String.padLeft 3 '0'
                 |> Html.text
@@ -221,7 +244,7 @@ viewBoard : Bool -> Board -> Html Msg
 viewBoard gameOver board =
     Html.div [ HtmlA.id "board" ]
         [ Html.div [ HtmlA.class "aspect" ]
-            [ board.cells
+            [ board
                 |> Dict.toList
                 |> List.map (viewCell gameOver)
                 |> Html.div [ HtmlA.class "cells" ]
@@ -229,28 +252,38 @@ viewBoard gameOver board =
         ]
 
 
-viewCell : Bool -> ( Position, Cell Cache ) -> Html Msg
-viewCell gameOver ( position, { state, mined, neighbouringMines } ) =
+viewCell : Bool -> ( Coord, CellState ) -> Html Msg
+viewCell gameOver ( coord, state ) =
     let
         ( x, y ) =
-            position
+            coord
+
+        isNum =
+            case state of
+                Num _ ->
+                    True
+
+                _ ->
+                    False
 
         minesCountClassName =
-            if state == Revealed then
-                neighbouringMines |> minesCountClass
+            case state of
+                Num n ->
+                    minesCountClass n
 
-            else
-                ""
+                _ ->
+                    ""
 
         interaction =
             if gameOver then
                 []
 
             else
-                [ onRightClick (ToggleFlag position)
-                , HtmlE.onClick (Reveal position)
-                , HtmlE.onMouseDown (SetPushed { position = position, pushed = True })
-                , HtmlE.onMouseLeave (SetPushed { position = position, pushed = False })
+                [ onRightClick (ToggleFlagCell coord)
+
+                --, HtmlE.onClick (SelectCell coord)
+                , HtmlE.onMouseDown (SinkCell coord)
+                , HtmlE.onMouseLeave (RaiseCell coord)
                 ]
     in
     Html.button
@@ -259,13 +292,16 @@ viewCell gameOver ( position, { state, mined, neighbouringMines } ) =
             , [ HtmlA.classList
                     [ ( "cell", True )
                     , ( "flagged", state == Flagged )
-                    , ( "revealed", state == Revealed )
-                    , ( "mined", (state == Revealed || gameOver) && mined )
-                    , ( "wrong", gameOver && not mined && state == Flagged )
-                    , ( "pushed", state == Hidden { pushed = True } )
-                    , ( minesCountClassName, state == Revealed && not mined )
+                    , ( "revealed", isNum )
+
+                    --, ( "mined", (isNum || gameOver) && mined )
+                    --, ( "wrong", gameOver && not mined && state == Flagged )
+                    , ( "pushed", state == Unclicked { pushed = True } )
+
+                    --, ( minesCountClassName, isNum && not mined )
                     ]
-              , HtmlA.style "grid-area" (String.fromInt (y + 1) ++ " / " ++ String.fromInt (x + 1) ++ " / auto / auto")
+              , HtmlA.style "grid-area"
+                    (String.fromInt (y + 1) ++ " / " ++ String.fromInt (x + 1) ++ " / auto / auto")
               ]
             ]
         )
@@ -277,14 +313,14 @@ minesCountClass count =
     "m" ++ String.fromInt count
 
 
-trySetPushed : Bool -> Cell a -> Cell a
-trySetPushed pushed cell =
-    case cell.state of
-        Hidden _ ->
-            { cell | state = Hidden { pushed = pushed } }
+trySinkCell : Bool -> CellState -> CellState
+trySinkCell pushed state =
+    case state of
+        Unclicked _ ->
+            Unclicked { pushed = pushed }
 
         _ ->
-            cell
+            state
 
 
 decodeKeyPress : Bool -> Json.Decoder Msg
@@ -293,7 +329,7 @@ decodeKeyPress changeTo =
         |> Json.map
             (\k ->
                 if k == "Control" then
-                    SetControlPressed changeTo
+                    SetCtrlPressed changeTo
 
                 else
                     NoOp
@@ -302,156 +338,168 @@ decodeKeyPress changeTo =
 
 changeBoard : Model -> (Board -> Board) -> ( Model, Cmd msg )
 changeBoard model change =
-    case model.game of
-        Loaded { board } ->
-            let
-                changed =
-                    change board
-            in
-            ( { model | game = Loaded { state = changed |> boardState, board = changed } }, Cmd.none )
+    let
+        game =
+            model.game
 
-        _ ->
-            ( model, Cmd.none )
+        board =
+            game.board
+
+        changed =
+            change board
+    in
+    ( { model | game = { game | state = gameState changed game.mineCoords, board = changed } }
+    , Cmd.none
+    )
 
 
-boardState : Board -> GameState
-boardState board =
+gameState : Board -> Maybe (List Coord) -> GameState
+gameState board mineCoords =
     let
         values =
-            board.cells |> Dict.values
+            board |> Dict.values
+
+        items =
+            board |> Dict.toList
+
+        isNum cell =
+            case cell of
+                Num _ ->
+                    True
+
+                _ ->
+                    False
     in
-    if values |> List.any (\c -> c.mined && c.state == Revealed) then
-        Lost
+    case mineCoords of
+        Nothing ->
+            Ready
 
-    else if values |> List.all (\c -> c.state == Revealed || c.mined) then
-        Won
+        Just mCoords ->
+            if values |> List.any (\c -> c == Mine) then
+                Lost
 
-    else
-        Playing
+            else if
+                items
+                    |> List.all
+                        (\( coord, cell ) -> List.member coord mCoords || isNum cell)
+            then
+                Won
+
+            else
+                Active
 
 
-minesCount : Cells a -> List Position -> Int
-minesCount cells positions =
-    positions
-        |> List.filterMap (\pos -> Dict.get pos cells)
-        |> List.map minesInCell
+minesCount : List Coord -> List Coord -> Int
+minesCount mineCoords coords =
+    coords
+        |> List.map
+            (\x ->
+                if List.member x mineCoords then
+                    1
+
+                else
+                    0
+            )
         |> List.sum
 
 
-minesInCell : Cell a -> Int
-minesInCell cell =
-    if cell.mined then
-        1
+minesInCell : CellState -> Int
+minesInCell state =
+    case state of
+        Mine ->
+            1
 
-    else
-        0
+        _ ->
+            0
 
 
-surrounding : Position -> List Position
+surrounding : Coord -> List Coord
 surrounding ( x, y ) =
     [ ( -1, -1 ), ( -1, 0 ), ( -1, 1 ), ( 0, -1 ), ( 0, 1 ), ( 1, -1 ), ( 1, 0 ), ( 1, 1 ) ]
         |> List.map (\( x2, y2 ) -> ( x + x2, y + y2 ))
 
 
-computeCaches : Cells {} -> Cells Cache
-computeCaches cells =
-    cells |> Dict.map (computeCache cells)
+nbrMines : Coord -> List Coord -> Int
+nbrMines coord mineCoords =
+    coord |> surrounding |> minesCount mineCoords
 
 
-computeCache : Cells {} -> Position -> Cell {} -> Cell Cache
-computeCache cells position { state, mined } =
-    { state = state, mined = mined, neighbouringMines = position |> surrounding |> minesCount cells }
+atCoord : Coord -> (CellState -> CellState) -> Board -> Board
+atCoord coord change board =
+    board |> Dict.update coord (Maybe.map change)
 
 
-atPosition : Position -> (Cell Cache -> Cell Cache) -> Board -> Board
-atPosition position change board =
-    { board | cells = board.cells |> Dict.update position (Maybe.map change) }
+
+--reveal : Board -> Coord -> CellState -> Board
+--reveal board coord state =
+--    let
+--        ( newCell, cellChanged ) =
+--            trySelectCell coord state
+--    in
+--    if cellChanged then
+--        let
+--            changedBoard =
+--                Dict.insert coord newCell board
+--        in
+--        if newCell.mined then
+--            changedBoard
+--
+--        else if nbrMines coord mineCoords then
+--            applyToSurrounding changedBoard coord reveal
+--
+--        else
+--            changedBoard
+--
+--    else
+--        board
 
 
-reveal : Board -> Position -> Cell Cache -> Board
-reveal board position cell =
-    let
-        ( newCell, cellChanged ) =
-            tryReveal cell
-    in
-    if cellChanged then
-        let
-            changedBoard =
-                { board | cells = Dict.insert position newCell board.cells }
-        in
-        if newCell.mined then
-            changedBoard
-
-        else if cell.neighbouringMines == 0 then
-            applyToSurrounding changedBoard position reveal
-
-        else
-            changedBoard
-
-    else
-        board
-
-
-applyToSurrounding : Board -> Position -> (Board -> Position -> Cell Cache -> Board) -> Board
-applyToSurrounding board position f =
-    surrounding position
-        |> List.filterMap (\pos -> Dict.get pos board.cells |> Maybe.map (\c -> ( pos, c )))
+applyToSurrounding : Board -> Coord -> (Board -> Coord -> CellState -> Board) -> Board
+applyToSurrounding board coord f =
+    surrounding coord
+        |> List.filterMap (\pos -> Dict.get pos board |> Maybe.map (\c -> ( pos, c )))
         |> List.foldl (\( pos, c ) -> \b -> f b pos c) board
 
 
-tryReveal : Cell a -> ( Cell a, Bool )
-tryReveal cell =
-    let
-        state =
-            case cell.state of
-                Hidden _ ->
-                    Revealed
 
-                Flagged ->
-                    Flagged
-
-                Revealed ->
-                    Revealed
-    in
-    ( { cell | state = state }, cell.state /= state )
-
-
-toggleFlag : Cell a -> Cell a
-toggleFlag cell =
-    let
-        state =
-            case cell.state of
-                Hidden _ ->
-                    Flagged
-
-                Flagged ->
-                    Hidden { pushed = False }
-
-                Revealed ->
-                    Revealed
-    in
-    { cell | state = state }
+--
+--trySelectCell : Coord -> CellState -> ( CellState, Bool )
+--trySelectCell coord state =
+--    let
+--        newState =
+--            case state of
+--                Unclicked _ ->
+--                    Num (nbrMines coord mineCoords)
+--
+--                x ->
+--                    x
+--    in
+--    ( newState, state /= newState )
 
 
-randomMinePositionGenerator : Int -> Int -> Random.Generator (Set Position)
-randomMinePositionGenerator size mines =
-    randomPositionGenerator size |> Random.set mines
+toggleFlag : CellState -> CellState
+toggleFlag state =
+    case state of
+        Unclicked _ ->
+            Flagged
+
+        Flagged ->
+            Unclicked { pushed = False }
+
+        x ->
+            x
 
 
-randomPositionGenerator : Int -> Random.Generator Position
-randomPositionGenerator size =
+randomMineCoordGenerator : Int -> Int -> Random.Generator (Set Coord)
+randomMineCoordGenerator size mines =
+    randomCoordGenerator size |> Random.set mines
+
+
+randomCoordGenerator : Int -> Random.Generator Coord
+randomCoordGenerator size =
     Random.map2 (\x -> \y -> ( x, y ))
         (Random.int 0 (size - 1))
         (Random.int 0 (size - 1))
-
-
-generateCell : Set Position -> Position -> ( Position, Cell {} )
-generateCell mined position =
-    ( position
-    , { state = Hidden { pushed = False }
-      , mined = mined |> Set.member position
-      }
-    )
 
 
 onRightClick : msg -> Html.Attribute msg
